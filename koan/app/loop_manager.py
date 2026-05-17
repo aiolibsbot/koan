@@ -16,6 +16,7 @@ CLI interface:
 """
 
 import argparse
+import contextlib
 import logging
 import os
 import re
@@ -424,16 +425,12 @@ def _skills_dir_mtime(instance_dir: str) -> float:
     """Get the max mtime of core and instance skills directories."""
     best = 0.0
     core_dir = Path(__file__).resolve().parent.parent / "skills" / "core"
-    try:
+    with contextlib.suppress(OSError):
         best = max(best, core_dir.stat().st_mtime)
-    except OSError:
-        pass
     instance_skills = Path(instance_dir) / "skills"
     if instance_skills.is_dir():
-        try:
+        with contextlib.suppress(OSError):
             best = max(best, instance_skills.stat().st_mtime)
-        except OSError:
-            pass
     return best
 
 
@@ -509,7 +506,7 @@ def _get_known_repos_from_projects(koan_root: str) -> Optional[set]:
     # 1. projects.yaml — primary source
     projects_config = load_projects_config(koan_root)
     if projects_config:
-        for name, proj in projects_config.get("projects", {}).items():
+        for proj in projects_config.get("projects", {}).values():
             if not isinstance(proj, dict):
                 continue
             gh_url = proj.get("github_url", "")
@@ -525,12 +522,12 @@ def _get_known_repos_from_projects(koan_root: str) -> Optional[set]:
         from app.projects_merged import get_all_github_urls_cache, get_github_url_cache
 
         # Primary URLs (origin remote)
-        for _name, url in get_github_url_cache().items():
+        for url in get_github_url_cache().values():
             if url:
                 known_repos.add(_normalize_github_url(url))
 
         # All remote URLs (origin + upstream + others)
-        for _name, urls in get_all_github_urls_cache().items():
+        for urls in get_all_github_urls_cache().values():
             for url in urls:
                 if url:
                     known_repos.add(_normalize_github_url(url))

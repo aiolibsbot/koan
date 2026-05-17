@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from app.claude_step import (
+    CI_STATUS_BLOCKED_APPROVAL,
     _build_pr_prompt,
     _fetch_branch,
     _fetch_failed_logs,
@@ -55,7 +56,7 @@ def fetch_pr_context(owner: str, repo: str, pr_number: str) -> dict:
     # Fetch PR metadata
     pr_json = run_gh(
         "pr", "view", pr_number, "--repo", full_repo, "--json",
-        "title,body,headRefName,baseRefName,state,author,url,headRepositoryOwner",
+        "title,body,headRefName,baseRefName,state,author,url,headRepositoryOwner,mergeable",
     )
 
     # Fetch review comment count from REST API for pending review detection.
@@ -137,6 +138,7 @@ def fetch_pr_context(owner: str, repo: str, pr_number: str) -> dict:
         "author": metadata.get("author", {}).get("login", ""),
         "head_owner": metadata.get("headRepositoryOwner", {}).get("login", ""),
         "url": metadata.get("url", ""),
+        "mergeable": metadata.get("mergeable", "UNKNOWN"),
         "diff": truncate_diff(diff, 32000),
         "review_comments": truncate_text(comments_json, 4000),
         "reviews": truncate_text(reviews_json, 3000),
@@ -688,10 +690,11 @@ def _get_conflicted_files(project_path: str) -> List[str]:
             capture_output=True, text=True, cwd=project_path,
             timeout=30,
         )
-        files = []
-        for line in result.stdout.splitlines():
-            if len(line) >= 4 and line[:2] in _UNMERGED_STATUSES:
-                files.append(line[3:].strip())
+        files = [
+            line[3:].strip()
+            for line in result.stdout.splitlines()
+            if len(line) >= 4 and line[:2] in _UNMERGED_STATUSES
+        ]
         return files
     except Exception as e:
         print(f"[rebase_pr] failed to list conflicted files: {e}", file=sys.stderr)
@@ -901,6 +904,10 @@ def _fix_existing_ci_failures(
             actions_log.append("Pre-push CI check: previous run passed")
         elif ci_status == "pending":
             actions_log.append("Pre-push CI check: previous run still pending")
+        elif ci_status == CI_STATUS_BLOCKED_APPROVAL:
+            actions_log.append(
+                "Pre-push CI check: previous run waiting for maintainer approval"
+            )
         else:
             actions_log.append("Pre-push CI check: no CI runs found")
         return False
@@ -1021,6 +1028,13 @@ def _run_ci_check_and_fix(
         actions_log.append("CI polling timed out")
         return "CI still running (timed out waiting)."
 
+    if ci_status == CI_STATUS_BLOCKED_APPROVAL:
+        # Workflow runs are gated on maintainer/environment approval —
+        # pushing more commits won't unstick them. Bail out instead of
+        # burning quota on fix attempts that can't possibly run.
+        actions_log.append("CI waiting for maintainer approval — skipping fixes")
+        return "CI waiting for maintainer approval — fixes skipped."
+
     # CI failed — attempt fixes
     for attempt in range(1, MAX_CI_FIX_ATTEMPTS + 1):
         # Check if PR has been merged or has conflicts before attempting fix
@@ -1090,6 +1104,15 @@ def _run_ci_check_and_fix(
         if ci_status in ("none", "timeout"):
             actions_log.append(f"CI {ci_status} after fix attempt {attempt}")
             return f"CI fix pushed (attempt {attempt}), CI status: {ci_status}."
+
+        if ci_status == CI_STATUS_BLOCKED_APPROVAL:
+            actions_log.append(
+                f"CI waiting for maintainer approval after fix attempt {attempt} — stopping"
+            )
+            return (
+                f"CI fix pushed (attempt {attempt}), but new run is waiting "
+                "for maintainer approval."
+            )
 
     # Exhausted retries — report failure with log excerpt
     log_excerpt = ci_logs[:2000] if ci_logs else "(no logs available)"
@@ -1355,8 +1378,7 @@ def _build_rebase_comment(
     change_items = _extract_change_items(actions_log, change_summary)
     if change_items:
         parts.append("### Changes applied\n")
-        for item in change_items:
-            parts.append(f"- {item}")
+        parts.extend(f"- {item}" for item in change_items)
         parts.append("")
 
     # ── 3. Stats ────────────────────────────────────────────────────
@@ -1373,8 +1395,7 @@ def _build_rebase_comment(
     ]
     if meaningful_actions:
         parts.append("<details>\n<summary>Actions performed</summary>\n")
-        for a in meaningful_actions:
-            parts.append(f"- {a}")
+        parts.extend(f"- {a}" for a in meaningful_actions)
         parts.append("\n</details>\n")
 
     # ── 5. CI ───────────────────────────────────────────────────────

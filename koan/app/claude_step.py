@@ -16,6 +16,14 @@ import time
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
+from app.cli_exec import popen_cli, stream_with_timeout
+from app.cli_provider import build_full_command, run_command
+from app.config import get_model_config
+from app.git_utils import get_current_branch as _git_utils_get_current_branch
+from app.git_utils import ordered_remotes, run_git_strict
+from app.github import pr_create, run_gh, sanitize_github_comment
+from app.prompts import load_prompt_or_skill
+
 
 class StepResult:
     """Result of a :func:`run_claude_step` invocation.
@@ -37,12 +45,6 @@ class StepResult:
     def __repr__(self) -> str:
         return f"StepResult(committed={self.committed!r}, output={self.output[:60]!r}...)"
 
-from app.cli_provider import build_full_command, run_command
-from app.config import get_model_config
-from app.git_utils import get_current_branch as _git_utils_get_current_branch
-from app.git_utils import ordered_remotes, run_git_strict
-from app.github import pr_create, run_gh, sanitize_github_comment
-from app.prompts import load_prompt_or_skill
 
 # Backward-compatible alias — callers should import from app.cli_provider
 run_claude_command = run_command
@@ -112,6 +114,30 @@ def _is_ancestor(maybe_ancestor: str, descendant: str, cwd: str) -> bool:
         return False
 
 
+def _prefetch_all_remotes(
+    base: str,
+    project_path: str,
+    preferred_remote: Optional[str] = None,
+    head_remote: Optional[str] = None,
+) -> None:
+    """Eagerly fetch the base branch from all relevant remotes.
+
+    Ensures every remote tracking ref is current before the rebase loop
+    starts, so that ancestry checks and --onto calculations use fresh data.
+    Failures are logged but never prevent the rebase attempt.
+    """
+    remotes_to_fetch: List[str] = list(_ordered_remotes(preferred_remote))
+    if head_remote and head_remote not in remotes_to_fetch:
+        remotes_to_fetch.append(head_remote)
+    for remote in remotes_to_fetch:
+        try:
+            _fetch_branch(remote, base, cwd=project_path)
+        except _REBASE_EXCEPTIONS as e:
+            print(f"[claude_step] Pre-fetch {remote}/{base} failed (non-fatal): {e}",
+                  file=sys.stderr)
+
+
+
 def _rebase_onto_target(
     base: str,
     project_path: str,
@@ -126,6 +152,9 @@ def _rebase_onto_target(
     ``upstream`` fallbacks.  When *head_remote* is known and differs from
     the target remote, uses ``--onto`` to replay only the PR's commits.
 
+    All relevant remotes are pre-fetched before the rebase loop so that
+    tracking refs are guaranteed fresh for ancestry checks and --onto.
+
     Args:
         on_conflict: Optional callback invoked when a rebase fails and a
             rebase-in-progress is detected (i.e. conflicts exist).
@@ -137,23 +166,9 @@ def _rebase_onto_target(
     Returns:
         Remote name used (e.g. "origin" or "upstream") on success, None on failure.
     """
+    _prefetch_all_remotes(base, project_path, preferred_remote, head_remote)
+
     for remote in _ordered_remotes(preferred_remote):
-        try:
-            _fetch_branch(remote, base, cwd=project_path)
-        except _REBASE_EXCEPTIONS as e:
-            print(f"[claude_step] Fetch {remote}/{base} failed: {e}", file=sys.stderr)
-            continue
-
-        # When head_remote differs from target, use --onto to limit
-        # replay to only the PR's commits.
-        if head_remote and head_remote != remote:
-            try:
-                _fetch_branch(head_remote, base, cwd=project_path)
-            except _REBASE_EXCEPTIONS as e:
-                print(f"[claude_step] Fetch {head_remote}/{base} failed: {e}", file=sys.stderr)
-                # Can't determine fork state — fall through to plain rebase
-                head_remote = None
-
         if head_remote and head_remote != remote:
             # Only use --onto when the fork has genuinely diverged from
             # upstream (i.e. has commits that upstream doesn't).  When the
@@ -211,59 +226,101 @@ def strip_cli_noise(text: str) -> str:
 
 
 def run_claude(cmd: list, cwd: str, timeout: int = 600) -> dict:
-    """Run a Claude Code CLI command.
+    """Run a Claude Code CLI command, streaming stdout in real time.
+
+    Thin wrapper around :func:`app.cli_exec.stream_with_timeout`. Each
+    Claude stdout line is forwarded to ``sys.stdout`` while also being
+    captured. Streaming serves two purposes:
+
+    1. Each emitted line resets the parent process's liveness watchdog
+       in ``run.py`` (default 600s), so long but still-progressing
+       Claude calls no longer get killed for "no output".
+    2. ``/live`` and the bridge see Claude's progress in real time
+       instead of a silent wait.
+
+    The subprocess is started with a new POSIX session
+    (``start_new_session=True``) so that on timeout the entire process
+    group can be killed — preventing grandchildren (e.g. tool-call
+    subprocesses) from holding the stdout pipe open and turning a
+    ``TimeoutExpired`` into an indefinite hang during pipe drain.
 
     Returns:
         Dict with keys: success (bool), output (str), error (str).
     """
-    from app.cli_exec import run_cli_with_retry
-
     from app.security_audit import SUBPROCESS_EXEC, _redact_list, log_event
 
     try:
-        result = run_cli_with_retry(
+        proc, cleanup = popen_cli(
             cmd,
-            capture_output=True, text=True,
-            timeout=timeout, cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=cwd,
+            start_new_session=True,
         )
-        if result.returncode != 0:
-            stderr_snippet = result.stderr[-500:] if result.stderr else "no stderr"
-            # When stderr is empty, stdout often contains the actual error
-            # (e.g. "Error: context window exceeded").  Include it so callers
-            # get actionable diagnostics instead of just "no stderr".
-            stdout_text = result.stdout.strip()
-            if not result.stderr and stdout_text:
-                stderr_snippet = f"no stderr | stdout: {stdout_text[-500:]}"
-            log_event(SUBPROCESS_EXEC, details={
-                "cmd": _redact_list(cmd),
-                "cwd": cwd,
-                "exit_code": result.returncode,
-            }, result="failure")
-            return {
-                "success": False,
-                "output": stdout_text,
-                "error": f"Exit code {result.returncode}: {stderr_snippet}",
-            }
+    except Exception as e:
         log_event(SUBPROCESS_EXEC, details={
             "cmd": _redact_list(cmd),
             "cwd": cwd,
-            "exit_code": 0,
-        })
+        }, result="failure")
         return {
-            "success": True,
-            "output": result.stdout.strip(),
-            "error": "",
+            "success": False,
+            "output": "",
+            "error": f"Failed to spawn CLI: {e}",
         }
-    except subprocess.TimeoutExpired:
+
+    try:
+        stream_result = stream_with_timeout(
+            proc,
+            timeout=timeout,
+            on_line=lambda line: print(line, flush=True),
+        )
+    finally:
+        cleanup()
+
+    stdout_text = stream_result.stdout
+    stderr_text = stream_result.stderr
+
+    if stream_result.timed_out:
         log_event(SUBPROCESS_EXEC, details={
             "cmd": _redact_list(cmd),
             "cwd": cwd,
         }, result="timeout")
         return {
             "success": False,
-            "output": "",
+            "output": stdout_text,
             "error": f"Timeout ({timeout}s)",
         }
+
+    returncode = proc.returncode
+    if returncode != 0:
+        stderr_snippet = stderr_text[-500:] if stderr_text else "no stderr"
+        # When stderr is empty, stdout often contains the actual error
+        # (e.g. "Error: context window exceeded").  Include it so callers
+        # get actionable diagnostics instead of just "no stderr".
+        if not stderr_text and stdout_text:
+            stderr_snippet = f"no stderr | stdout: {stdout_text[-500:]}"
+        log_event(SUBPROCESS_EXEC, details={
+            "cmd": _redact_list(cmd),
+            "cwd": cwd,
+            "exit_code": returncode,
+        }, result="failure")
+        return {
+            "success": False,
+            "output": stdout_text,
+            "error": f"Exit code {returncode}: {stderr_snippet}",
+        }
+
+    log_event(SUBPROCESS_EXEC, details={
+        "cmd": _redact_list(cmd),
+        "cwd": cwd,
+        "exit_code": 0,
+    })
+    return {
+        "success": True,
+        "output": stdout_text,
+        "error": "",
+    }
 
 
 def commit_if_changes(project_path: str, message: str) -> bool:
@@ -435,6 +492,105 @@ def _safe_checkout(branch: str, project_path: str) -> None:
         print(f"[claude_step] Safe checkout failed for {branch}: {e}", file=sys.stderr)
 
 
+# Conclusions that don't signal a real CI outcome. The classic case is
+# "Dependabot auto-merge", which runs on every PR but only acts on
+# Dependabot-authored PRs — on every other PR it completes with
+# conclusion="skipped". Treating that as a CI failure sends Kōan into a
+# fix loop against a workflow that isn't actually broken.
+_IGNORED_CI_CONCLUSIONS = frozenset(
+    {"skipped", "cancelled", "neutral", "action_required"}
+)
+
+# Workflow run statuses that mean "blocked, awaiting manual action".
+# GitHub sets `status="action_required"` on fork PRs from first-time
+# contributors until a maintainer approves the run, and `status="waiting"`
+# when a job is gated on environment approval. In both cases, polling
+# forever — or, worse, pushing new commits to "fix" CI — never unsticks
+# the run. Kōan must treat these as terminal so the PR drops out of the
+# ## CI queue with a human-readable note.
+_APPROVAL_BLOCKED_STATUSES = frozenset({"action_required", "waiting"})
+
+# Canonical CI status string returned by aggregate_ci_runs() and
+# wait_for_ci() when a workflow run is blocked on maintainer or
+# environment approval.  Use the constant instead of the raw string
+# to avoid typos across modules.
+CI_STATUS_BLOCKED_APPROVAL = "blocked_approval"
+
+# Upper bound on runs fetched per branch — enough to cover all workflows
+# triggered by a single push (typically <10), small enough to keep the
+# `gh run list` call cheap.
+_CI_RUN_LIMIT = 20
+
+
+def aggregate_ci_runs(runs: list) -> Tuple[str, Optional[int]]:
+    """Reduce a list of workflow runs to a single (status, run_id) tuple.
+
+    Filters out runs whose conclusion is in :data:`_IGNORED_CI_CONCLUSIONS`
+    (notably the "Dependabot auto-merge" skip case) before aggregating, so
+    a benign skipped workflow doesn't masquerade as a CI failure.
+
+    Aggregation rules over the remaining runs:
+    - any failed completed run → ("failure", failed_run_id)
+    - else any run blocked on maintainer/environment approval →
+      ("blocked_approval", blocked_run_id) — Kōan can't unstick it, so
+      callers should stop retrying and surface a notification.
+    - else any non-completed run → ("pending", pending_run_id)
+    - else all completed + success → ("success", first_run_id)
+    - empty input or every run filtered out → ("none", None)
+
+    Failure takes precedence over blocked_approval so a genuinely broken
+    workflow on the same push still gets surfaced for a fix attempt.
+    """
+    if not runs:
+        return ("none", None)
+
+    relevant = [
+        r for r in runs
+        if (r.get("conclusion") or "").lower() not in _IGNORED_CI_CONCLUSIONS
+    ]
+    if not relevant:
+        return ("none", None)
+
+    failed_run = None
+    blocked_run = None
+    pending_run = None
+    for run in relevant:
+        status = (run.get("status") or "").lower()
+        conclusion = (run.get("conclusion") or "").lower()
+        if status == "completed":
+            if conclusion != "success" and failed_run is None:
+                failed_run = run
+        elif status in _APPROVAL_BLOCKED_STATUSES:
+            if blocked_run is None:
+                blocked_run = run
+        elif pending_run is None:
+            pending_run = run
+
+    if failed_run is not None:
+        return ("failure", failed_run.get("databaseId"))
+    if blocked_run is not None:
+        return (CI_STATUS_BLOCKED_APPROVAL, blocked_run.get("databaseId"))
+    if pending_run is not None:
+        return ("pending", pending_run.get("databaseId"))
+    return ("success", relevant[0].get("databaseId"))
+
+
+def fetch_branch_ci_runs(branch: str, full_repo: str) -> list:
+    """Return raw `gh run list` entries for a branch.
+
+    Raises on `gh` failure so callers can decide between fall-back
+    behaviours (e.g. "treat as pending" vs "treat as none").
+    """
+    raw = run_gh(
+        "run", "list",
+        "--branch", branch,
+        "--repo", full_repo,
+        "--json", "databaseId,status,conclusion,name,workflowName",
+        "--limit", str(_CI_RUN_LIMIT),
+    )
+    return json.loads(raw) if raw.strip() else []
+
+
 def wait_for_ci(
     branch: str,
     full_repo: str,
@@ -452,7 +608,7 @@ def wait_for_ci(
 
     Returns:
         (status, run_id, logs) where:
-        - status: "success", "failure", "timeout", or "none"
+        - status: "success", "failure", "blocked_approval", "timeout", or "none"
         - run_id: GitHub Actions run ID (None if no runs found)
         - logs: Failed job logs (empty unless status is "failure")
     """
@@ -463,37 +619,34 @@ def wait_for_ci(
 
     while time.time() < deadline:
         try:
-            raw = run_gh(
-                "run", "list",
-                "--branch", branch,
-                "--repo", full_repo,
-                "--json", "databaseId,status,conclusion",
-                "--limit", "1",
-            )
-            runs = json.loads(raw) if raw.strip() else []
+            runs = fetch_branch_ci_runs(branch, full_repo)
         except Exception as e:
             print(f"[claude_step] CI poll error: {e}", file=sys.stderr)
             time.sleep(poll_interval)
             continue
 
-        if not runs:
-            # No CI runs found for this branch — common for repos without CI
+        status, run_id = aggregate_ci_runs(runs)
+
+        if status == "none":
+            # No CI signal — either no runs, or every run was filtered as
+            # non-CI (e.g. a Dependabot auto-merge skip with nothing else
+            # registered yet). Mirror the original "no runs" exit.
             return ("none", None, "")
 
-        run = runs[0]
-        run_id = run.get("databaseId")
-        status = run.get("status", "").lower()
-        conclusion = run.get("conclusion", "").lower()
+        if status == "success":
+            return ("success", run_id, "")
 
-        if status == "completed":
-            if conclusion == "success":
-                return ("success", run_id, "")
-
-            # CI failed — fetch logs for failed jobs
-            logs = _fetch_failed_logs(run_id, full_repo)
+        if status == "failure":
+            logs = _fetch_failed_logs(run_id, full_repo) if run_id else ""
             return ("failure", run_id, logs)
 
-        # Still running — wait and poll again
+        if status == CI_STATUS_BLOCKED_APPROVAL:
+            # A maintainer (or environment reviewer) must click Approve in
+            # the GitHub UI; polling won't change that. Exit so the caller
+            # can surface a notification instead of burning quota.
+            return (CI_STATUS_BLOCKED_APPROVAL, run_id, "")
+
+        # status == "pending" — keep polling
         time.sleep(poll_interval)
 
     return ("timeout", None, "")
@@ -539,39 +692,23 @@ def check_existing_ci(
 
     Returns:
         (status, run_id, logs) where:
-        - status: "success", "failure", "pending", or "none"
+        - status: "success", "failure", "pending", "blocked_approval", or "none"
         - run_id: GitHub Actions run ID (None if no runs found)
         - logs: Failed job logs (empty unless status is "failure")
     """
     try:
-        raw = run_gh(
-            "run", "list",
-            "--branch", branch,
-            "--repo", full_repo,
-            "--json", "databaseId,status,conclusion",
-            "--limit", "1",
-        )
-        runs = json.loads(raw) if raw.strip() else []
+        runs = fetch_branch_ci_runs(branch, full_repo)
     except Exception as e:
         print(f"[claude_step] CI check error: {e}", file=sys.stderr)
         return ("none", None, "")
 
-    if not runs:
-        return ("none", None, "")
+    status, run_id = aggregate_ci_runs(runs)
 
-    run = runs[0]
-    run_id = run.get("databaseId")
-    status = run.get("status", "").lower()
-    conclusion = run.get("conclusion", "").lower()
-
-    if status == "completed":
-        if conclusion == "success":
-            return ("success", run_id, "")
-        logs = _fetch_failed_logs(run_id, full_repo)
+    if status == "failure":
+        logs = _fetch_failed_logs(run_id, full_repo) if run_id else ""
         return ("failure", run_id, logs)
 
-    # Still running or queued
-    return ("pending", run_id, "")
+    return (status, run_id, "")
 
 
 def _is_permission_error(error_msg: str) -> bool:

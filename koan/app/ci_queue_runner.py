@@ -17,49 +17,35 @@ Two roles:
 All status/debug output goes to stderr; stdout is reserved for JSON.
 """
 
+import contextlib
 import json
 import sys
 from pathlib import Path
 from typing import Optional, Tuple
 
+from app.claude_step import CI_STATUS_BLOCKED_APPROVAL
+
 
 def check_ci_status(branch: str, full_repo: str) -> Tuple[str, Optional[int]]:
     """Make a single non-blocking CI status check.
+
+    Aggregates all recent workflow runs for the branch, ignoring conclusions
+    that don't represent real CI signal (e.g. a "Dependabot auto-merge"
+    run that completes with conclusion="skipped" on non-Dependabot PRs).
 
     Returns:
         (status, run_id) where status is one of:
         "success", "failure", "pending", "none"
     """
-    from app.github import run_gh
+    from app.claude_step import aggregate_ci_runs, fetch_branch_ci_runs
 
     try:
-        raw = run_gh(
-            "run", "list",
-            "--branch", branch,
-            "--repo", full_repo,
-            "--json", "databaseId,status,conclusion",
-            "--limit", "1",
-        )
-        runs = json.loads(raw) if raw.strip() else []
+        runs = fetch_branch_ci_runs(branch, full_repo)
     except Exception as e:
         print(f"[ci_queue] CI status check error: {e}", file=sys.stderr)
         return ("pending", None)
 
-    if not runs:
-        return ("none", None)
-
-    run = runs[0]
-    run_id = run.get("databaseId")
-    status = run.get("status", "").lower()
-    conclusion = run.get("conclusion", "").lower()
-
-    if status == "completed":
-        if conclusion == "success":
-            return ("success", run_id)
-        return ("failure", run_id)
-
-    # in_progress, queued, waiting, etc.
-    return ("pending", run_id)
+    return aggregate_ci_runs(runs)
 
 
 def drain_one(instance_dir: str) -> Optional[str]:
@@ -131,7 +117,7 @@ def drain_one(instance_dir: str) -> Optional[str]:
             )
             _write_outbox(
                 instance_dir,
-                f"❌ CI still failing after {max_attempts} attempts for PR #{pr_number}: {pr_url}",
+                f"🚦 CI still failing after {max_attempts} attempts for PR #{pr_number}: {pr_url}",
             )
             return f"CI failed {max_attempts} times for PR #{pr_number} — giving up"
 
@@ -141,6 +127,25 @@ def drain_one(instance_dir: str) -> Optional[str]:
             lambda c: remove_ci_item(c, pr_url),
         )
         return f"No CI runs found for PR #{pr_number} — removed from ## CI"
+
+    if status == CI_STATUS_BLOCKED_APPROVAL:
+        # GitHub gates workflow runs on first-time-contributor or
+        # environment approval; nothing Kōan does will unstick them.
+        # Drop the PR from ## CI so retries stop and notify the human
+        # so they can approve in the UI (or politely ping the maintainer).
+        modify_missions_file(
+            missions_path,
+            lambda c: remove_ci_item(c, pr_url),
+        )
+        _write_outbox(
+            instance_dir,
+            f"⏸ CI workflows on PR #{pr_number} are waiting for maintainer "
+            f"approval — Kōan stopped retrying: {pr_url}",
+        )
+        return (
+            f"CI blocked on maintainer approval for PR #{pr_number} — "
+            f"removed from ## CI"
+        )
 
     # status == "pending" — leave in ## CI
     return None
@@ -204,10 +209,8 @@ def _maybe_migrate_json_queue(instance_dir: str, missions_path: Path):
         entries = []
 
     if not entries:
-        try:
+        with contextlib.suppress(OSError):
             os.remove(json_path)
-        except OSError:
-            pass
         return
 
     from app.missions import add_ci_item
@@ -345,6 +348,14 @@ def run_ci_check_and_fix(pr_url: str, project_path: str) -> Tuple[bool, str]:
         # CI still running — don't attempt fixes against stale logs.
         # drain_one will re-check on the next iteration when CI completes.
         return False, "CI still pending — will retry when CI completes."
+
+    if status == CI_STATUS_BLOCKED_APPROVAL:
+        # Pushing more commits won't trigger CI either — the new runs
+        # need the same approval. Bail out so the operator can act.
+        return False, (
+            "CI workflows are waiting for maintainer approval — "
+            "cannot fix without an approve click in the GitHub UI."
+        )
 
     if status not in ("failure",):
         return False, f"CI status is '{status}' — nothing to fix."
@@ -523,6 +534,14 @@ def _attempt_ci_fixes(
             _reenqueue_for_monitoring(pr_url, branch, full_repo, pr_number, project_path)
             actions_log.append(f"CI running after fix push (attempt {attempt}) — re-enqueued for monitoring")
             return True
+
+        if new_status == CI_STATUS_BLOCKED_APPROVAL:
+            # New push triggered runs that also need maintainer approval —
+            # nothing we can do here, bail out instead of re-enqueueing.
+            actions_log.append(
+                f"CI waiting for maintainer approval after fix push (attempt {attempt}) — stopping"
+            )
+            return False
 
         # CI already shows failure (unlikely this fast) — get new logs
         if new_run_id:

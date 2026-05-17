@@ -5,7 +5,7 @@ from app.github_skill_helpers import (
     extract_github_url,
     format_project_not_found_error,
     format_success_message,
-    queue_github_mission,
+    queue_github_mission_once,
     resolve_project_for_repo,
 )
 
@@ -47,6 +47,11 @@ def handle(ctx):
     if not project_path:
         return format_project_not_found_error(repo, owner=owner)
 
-    queue_github_mission(ctx, "squash", pr_url, project_name)
+    duplicate = queue_github_mission_once(
+        ctx, "squash", pr_url, project_name,
+        type_label="PR", number=pr_number, owner=owner, repo=repo,
+    )
+    if duplicate:
+        return duplicate
 
     return f"Squash queued for {format_success_message('PR', pr_number, owner, repo)}"

@@ -548,20 +548,17 @@ def _format_review_as_markdown(review_data: dict, title: str = "") -> str:
         if met:
             lines.append(f"✅ **Met** ({len(met)})")
             lines.append("")
-            for req in met:
-                lines.append(f"- {req}")
+            lines.extend(f"- {req}" for req in met)
             lines.append("")
         if missing:
             lines.append(f"❌ **Missing** ({len(missing)})")
             lines.append("")
-            for req in missing:
-                lines.append(f"- {req}")
+            lines.extend(f"- {req}" for req in missing)
             lines.append("")
         if out_of_scope:
             lines.append(f"📋 **Out of scope** ({len(out_of_scope)})")
             lines.append("")
-            for item in out_of_scope:
-                lines.append(f"- {item}")
+            lines.extend(f"- {item}" for item in out_of_scope)
             lines.append("")
         lines.append("---")
         lines.append("")
@@ -633,6 +630,15 @@ def _format_review_as_markdown(review_data: dict, title: str = "") -> str:
     lines.append(summary_data["summary"])
 
     return "\n".join(lines)
+
+
+def _conflict_notice(base: str) -> str:
+    """Build a prominent warning block when a PR has unresolved merge conflicts."""
+    return (
+        f"> ⚠️ **Merge conflicts detected** — this PR conflicts with `{base}` "
+        f"and cannot be merged until the author rebases (or merges in `{base}`) "
+        f"and resolves the conflicted files."
+    )
 
 
 def _post_review_comment(
@@ -1012,6 +1018,12 @@ def run_review(
             file=sys.stderr,
         )
         review_body = _extract_review_body(raw_output)
+
+    # Prepend merge-conflict notice when the PR is in CONFLICTING state.
+    # The code review alone never surfaces this — the human needs an explicit
+    # call to resolve conflicts before merge is possible.
+    if context.get("mergeable") == "CONFLICTING":
+        review_body = _conflict_notice(context.get("base", "main")) + "\n\n" + review_body
 
     # Step 6: Post (or update) review comment (Phase 3 — idempotent upsert)
     # Commit SHAs are embedded in the body upfront to avoid extra API calls.

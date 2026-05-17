@@ -15,6 +15,7 @@ Usage:
     make dashboard
 """
 
+import contextlib
 import json
 import os
 import re
@@ -210,10 +211,8 @@ def get_agent_state() -> dict:
     project_file = KOAN_ROOT / PROJECT_FILE
     project = ""
     if project_file.exists():
-        try:
+        with contextlib.suppress(OSError):
             project = project_file.read_text().strip()
-        except OSError:
-            pass
 
     # Read focus state
     focus = None
@@ -356,11 +355,10 @@ def get_journal_entries(limit: int = 7) -> list:
         # Check nested structure
         nested = JOURNAL_DIR / d
         if nested.is_dir():
-            for f in sorted(nested.glob("*.md")):
-                day_entries.append({
-                    "project": f.stem,
-                    "content": f.read_text(),
-                })
+            day_entries.extend(
+                {"project": f.stem, "content": f.read_text()}
+                for f in sorted(nested.glob("*.md"))
+            )
         # Check flat structure
         flat = JOURNAL_DIR / f"{d}.md"
         if flat.is_file():
@@ -1332,9 +1330,11 @@ def api_agent_memory():
     global_files = []
     global_dir = memory_dir / "global"
     if global_dir.is_dir():
-        for f in sorted(global_dir.iterdir()):
-            if f.is_file() and f.suffix in (".md", ".txt"):
-                global_files.append({**_read_capped(f), "name": f.name})
+        global_files.extend(
+            {**_read_capped(f), "name": f.name}
+            for f in sorted(global_dir.iterdir())
+            if f.is_file() and f.suffix in (".md", ".txt")
+        )
 
     # Per-project files under memory/projects/{name}/
     projects: dict = {}
@@ -1343,10 +1343,11 @@ def api_agent_memory():
         for proj_dir in sorted(projects_dir.iterdir()):
             if not proj_dir.is_dir():
                 continue
-            files = []
-            for f in sorted(proj_dir.iterdir()):
-                if f.is_file() and f.suffix in (".md", ".txt"):
-                    files.append({**_read_capped(f), "name": f.name})
+            files = [
+                {**_read_capped(f), "name": f.name}
+                for f in sorted(proj_dir.iterdir())
+                if f.is_file() and f.suffix in (".md", ".txt")
+            ]
             if files:
                 projects[proj_dir.name] = files
 
@@ -1371,13 +1372,14 @@ def api_agent_skills():
 
     skills_list = []
     for skill in registry.list_all():
-        commands = []
-        for cmd in skill.commands:
-            commands.append({
+        commands = [
+            {
                 "name": cmd.name,
                 "aliases": list(cmd.aliases) if cmd.aliases else [],
                 "description": cmd.description or "",
-            })
+            }
+            for cmd in skill.commands
+        ]
         skills_list.append({
             "name": skill.name,
             "scope": skill.scope,

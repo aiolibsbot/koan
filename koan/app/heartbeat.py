@@ -8,6 +8,7 @@ Runs during interruptible sleep in the agent loop. Provides:
 All checks are pure Python file operations — no API calls, no subprocess.
 """
 
+import contextlib
 import shutil
 import time
 from datetime import datetime
@@ -118,10 +119,8 @@ def _get_last_journal_activity(instance_dir: str, project_name: str = None) -> f
     # Check pending.md (written during active runs)
     pending = journal_dir / "pending.md"
     if pending.exists():
-        try:
+        with contextlib.suppress(OSError):
             mtimes.append(pending.stat().st_mtime)
-        except OSError:
-            pass
 
     # Check today's journal directory
     today = datetime.now().strftime("%Y-%m-%d")
@@ -137,9 +136,9 @@ def _get_last_journal_activity(instance_dir: str, project_name: str = None) -> f
                         mtimes.append(f.stat().st_mtime)
             # Always include any file if we didn't find the project-specific one
             if not mtimes:
-                for f in today_dir.iterdir():
-                    if f.is_file():
-                        mtimes.append(f.stat().st_mtime)
+                mtimes.extend(
+                    f.stat().st_mtime for f in today_dir.iterdir() if f.is_file()
+                )
         except OSError:
             pass
 

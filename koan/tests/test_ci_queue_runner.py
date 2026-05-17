@@ -3,6 +3,8 @@
 import json
 from unittest.mock import MagicMock, patch
 
+from app.claude_step import CI_STATUS_BLOCKED_APPROVAL
+
 import pytest
 
 
@@ -409,3 +411,335 @@ class TestAttemptCiFixes:
             )
 
         mock_modify.assert_called_once()
+
+
+class TestAggregateCiRuns:
+    """Aggregation rules for `gh run list` output — especially skip-conclusion handling."""
+
+    def test_empty_input_returns_none(self):
+        from app.claude_step import aggregate_ci_runs
+
+        assert aggregate_ci_runs([]) == ("none", None)
+
+    def test_all_success_returns_success(self):
+        from app.claude_step import aggregate_ci_runs
+
+        runs = [
+            {"databaseId": 1, "status": "completed", "conclusion": "success"},
+            {"databaseId": 2, "status": "completed", "conclusion": "success"},
+        ]
+        assert aggregate_ci_runs(runs) == ("success", 1)
+
+    def test_failure_wins_over_pending(self):
+        """A failed completed run takes priority over an in-progress one."""
+        from app.claude_step import aggregate_ci_runs
+
+        runs = [
+            {"databaseId": 1, "status": "in_progress", "conclusion": ""},
+            {"databaseId": 2, "status": "completed", "conclusion": "failure"},
+            {"databaseId": 3, "status": "completed", "conclusion": "success"},
+        ]
+        status, run_id = aggregate_ci_runs(runs)
+        assert status == "failure"
+        assert run_id == 2
+
+    def test_pending_returned_when_no_completed_failures(self):
+        from app.claude_step import aggregate_ci_runs
+
+        runs = [
+            {"databaseId": 1, "status": "completed", "conclusion": "success"},
+            {"databaseId": 2, "status": "in_progress", "conclusion": ""},
+        ]
+        status, run_id = aggregate_ci_runs(runs)
+        assert status == "pending"
+        assert run_id == 2
+
+    def test_dependabot_auto_merge_skip_is_ignored(self):
+        """Regression: a 'Dependabot auto-merge' workflow that completes with
+        conclusion='skipped' on a non-Dependabot PR must not be reported as a
+        CI failure. See aio-libs/yarl PR #1681 — Kōan kept queueing /ci_check
+        fix missions because `gh run list --limit 1` returned the skipped
+        Dependabot run instead of the actual CI workflows.
+        """
+        from app.claude_step import aggregate_ci_runs
+
+        # This mirrors the actual `gh run list` payload for the yarl PR:
+        # the Dependabot auto-merge run lands first by databaseId order, but
+        # the real CI workflows are all green.
+        runs = [
+            {
+                "databaseId": 25970779376,
+                "status": "completed",
+                "conclusion": "skipped",
+                "workflowName": "Dependabot auto-merge",
+            },
+            {
+                "databaseId": 25970779403,
+                "status": "completed",
+                "conclusion": "success",
+                "workflowName": "CodeQL",
+            },
+            {
+                "databaseId": 25970779406,
+                "status": "completed",
+                "conclusion": "success",
+                "workflowName": "Aiohttp",
+            },
+        ]
+        status, run_id = aggregate_ci_runs(runs)
+        assert status == "success"
+        # The reported run_id must point at a real CI workflow, never the
+        # skipped Dependabot run — otherwise log fetching would target the
+        # wrong run and report no failures.
+        assert run_id != 25970779376
+
+    def test_dependabot_skip_with_pending_real_ci_returns_pending(self):
+        """If only the Dependabot run completed (skipped) and real CI is still
+        running, surface pending — not failure, not success.
+        """
+        from app.claude_step import aggregate_ci_runs
+
+        runs = [
+            {
+                "databaseId": 25970779376,
+                "status": "completed",
+                "conclusion": "skipped",
+                "workflowName": "Dependabot auto-merge",
+            },
+            {
+                "databaseId": 25970779458,
+                "status": "in_progress",
+                "conclusion": "",
+                "workflowName": "CI/CD",
+            },
+        ]
+        status, run_id = aggregate_ci_runs(runs)
+        assert status == "pending"
+        assert run_id == 25970779458
+
+    def test_cancelled_and_neutral_also_ignored(self):
+        """`cancelled`, `neutral`, `action_required` are not real CI failures."""
+        from app.claude_step import aggregate_ci_runs
+
+        runs = [
+            {"databaseId": 1, "status": "completed", "conclusion": "cancelled"},
+            {"databaseId": 2, "status": "completed", "conclusion": "neutral"},
+            {"databaseId": 3, "status": "completed", "conclusion": "action_required"},
+            {"databaseId": 4, "status": "completed", "conclusion": "success"},
+        ]
+        assert aggregate_ci_runs(runs) == ("success", 4)
+
+    def test_all_skipped_returns_none(self):
+        """When every workflow run was filtered out, we have no CI signal."""
+        from app.claude_step import aggregate_ci_runs
+
+        runs = [
+            {"databaseId": 1, "status": "completed", "conclusion": "skipped"},
+            {"databaseId": 2, "status": "completed", "conclusion": "cancelled"},
+        ]
+        assert aggregate_ci_runs(runs) == ("none", None)
+
+    def test_missing_conclusion_field_treated_as_pending(self):
+        from app.claude_step import aggregate_ci_runs
+
+        runs = [
+            {"databaseId": 1, "status": "queued"},
+        ]
+        status, run_id = aggregate_ci_runs(runs)
+        assert status == "pending"
+        assert run_id == 1
+
+    def test_action_required_status_returns_blocked_approval(self):
+        """Workflow runs gated on maintainer approval (fork PR from a
+        first-time contributor) come back with status='action_required'
+        and no conclusion. They must surface as blocked_approval so
+        callers stop retrying — pushing more commits won't unstick them.
+        See https://github.com/aio-libs/aiohttp/pull/12553 — Kōan retried
+        the same PR multiple times while every workflow run sat waiting
+        for an approve click.
+        """
+        from app.claude_step import aggregate_ci_runs
+
+        runs = [
+            {"databaseId": 10, "status": "action_required", "conclusion": None},
+        ]
+        status, run_id = aggregate_ci_runs(runs)
+        assert status == CI_STATUS_BLOCKED_APPROVAL
+        assert run_id == 10
+
+    def test_waiting_status_returns_blocked_approval(self):
+        """`waiting` status signals an environment-protection gate — also
+        a "human must click" state that Kōan can't move past.
+        """
+        from app.claude_step import aggregate_ci_runs
+
+        runs = [
+            {"databaseId": 11, "status": "waiting", "conclusion": None},
+        ]
+        status, run_id = aggregate_ci_runs(runs)
+        assert status == CI_STATUS_BLOCKED_APPROVAL
+        assert run_id == 11
+
+    def test_failure_wins_over_blocked_approval(self):
+        """If one workflow is genuinely failing and another is blocked on
+        approval, prioritise the failure: that one CAN still be fixed by
+        pushing new commits.
+        """
+        from app.claude_step import aggregate_ci_runs
+
+        runs = [
+            {"databaseId": 1, "status": "action_required", "conclusion": None},
+            {"databaseId": 2, "status": "completed", "conclusion": "failure"},
+        ]
+        status, run_id = aggregate_ci_runs(runs)
+        assert status == "failure"
+        assert run_id == 2
+
+    def test_blocked_approval_wins_over_pending(self):
+        """A blocked run alongside an in-progress one should still surface
+        as blocked — the in-progress run is a coincidence, the gate is the
+        actionable state for the human.
+        """
+        from app.claude_step import aggregate_ci_runs
+
+        runs = [
+            {"databaseId": 1, "status": "in_progress", "conclusion": ""},
+            {"databaseId": 2, "status": "action_required", "conclusion": None},
+        ]
+        status, run_id = aggregate_ci_runs(runs)
+        assert status == CI_STATUS_BLOCKED_APPROVAL
+        assert run_id == 2
+
+
+class TestDrainOneBlockedApproval:
+    """drain_one must remove a PR from ## CI when its workflows are
+    blocked on maintainer approval, instead of polling forever.
+    """
+
+    PR_URL = "https://github.com/owner/repo/pull/42"
+
+    def _missions_with_ci_entry(self):
+        return (
+            "# Missions\n\n## CI\n\n"
+            f"- [project:proj] {self.PR_URL} branch:fix-branch repo:owner/repo"
+            f" queued:2026-04-01T10:00 (attempt 0/5)\n\n"
+            "## Pending\n\n## Done\n"
+        )
+
+    def test_blocked_approval_removes_entry_and_notifies(self):
+        from app.ci_queue_runner import drain_one
+
+        with (
+            patch("pathlib.Path.exists", return_value=True),
+            patch("pathlib.Path.read_text", return_value=self._missions_with_ci_entry()),
+            patch("app.ci_queue_runner._maybe_migrate_json_queue"),
+            patch("app.utils.modify_missions_file") as mock_modify,
+            patch(
+                "app.ci_queue_runner.check_ci_status",
+                return_value=(CI_STATUS_BLOCKED_APPROVAL, 999),
+            ),
+            patch("app.ci_queue_runner._write_outbox") as mock_outbox,
+            patch("app.ci_queue_runner._inject_ci_fix_mission") as mock_inject,
+        ):
+            result = drain_one("/tmp/instance")
+
+        assert result is not None
+        assert "approval" in result.lower()
+        mock_modify.assert_called()
+        mock_outbox.assert_called_once()
+        # Outbox message should reference the PR so the human can act
+        assert self.PR_URL in mock_outbox.call_args[0][1]
+        assert "approval" in mock_outbox.call_args[0][1].lower()
+        # No fix mission should be queued — Kōan can't unstick it
+        mock_inject.assert_not_called()
+
+
+class TestRunCiCheckBlockedApproval:
+    """run_ci_check_and_fix must bail out, not attempt fixes, when CI is
+    gated on maintainer approval.
+    """
+
+    PR_URL = "https://github.com/owner/repo/pull/42"
+    PROJECT_PATH = "/tmp/test-project"
+
+    def test_blocked_approval_returns_early_without_fix(self):
+        from app.ci_queue_runner import run_ci_check_and_fix
+
+        fake_context = {"branch": "fix-branch", "base": "main"}
+        with (
+            patch("app.rebase_pr.fetch_pr_context", return_value=fake_context),
+            patch(
+                "app.ci_queue_runner.check_ci_status",
+                return_value=(CI_STATUS_BLOCKED_APPROVAL, 123),
+            ),
+            patch("app.ci_queue_runner._attempt_ci_fixes") as mock_fix,
+        ):
+            success, summary = run_ci_check_and_fix(self.PR_URL, self.PROJECT_PATH)
+
+        assert success is False
+        assert "approval" in summary.lower()
+        # The pipeline must not attempt Claude-based fixes
+        mock_fix.assert_not_called()
+
+
+class TestCheckCiStatusDependabot:
+    """End-to-end: check_ci_status must not treat skipped Dependabot runs as failures."""
+
+    def test_dependabot_skip_does_not_trigger_failure(self):
+        """Regression for aio-libs/yarl PR #1681 — Kōan repeatedly queued
+        /ci_check fix missions because check_ci_status returned ('failure',
+        <dependabot_skip_run_id>) for a healthy PR.
+        """
+        from app.ci_queue_runner import check_ci_status
+
+        gh_payload = json.dumps([
+            {
+                "databaseId": 25970779376,
+                "status": "completed",
+                "conclusion": "skipped",
+                "workflowName": "Dependabot auto-merge",
+            },
+            {
+                "databaseId": 25970779403,
+                "status": "completed",
+                "conclusion": "success",
+                "workflowName": "CodeQL",
+            },
+        ])
+        with patch("app.claude_step.run_gh", return_value=gh_payload):
+            status, run_id = check_ci_status("koan/fix-issue-1680", "aio-libs/yarl")
+
+        assert status == "success"
+        assert run_id == 25970779403
+
+    def test_check_existing_ci_dependabot_skip_does_not_fetch_logs(self):
+        """The other single-shot caller (`check_existing_ci`) must also ignore
+        the skipped Dependabot run, otherwise we'd waste an `_fetch_failed_logs`
+        call on a workflow that produced no logs.
+        """
+        from app.claude_step import check_existing_ci
+
+        gh_payload = json.dumps([
+            {
+                "databaseId": 25970779376,
+                "status": "completed",
+                "conclusion": "skipped",
+                "workflowName": "Dependabot auto-merge",
+            },
+            {
+                "databaseId": 25970779403,
+                "status": "completed",
+                "conclusion": "success",
+                "workflowName": "CodeQL",
+            },
+        ])
+        with (
+            patch("app.claude_step.run_gh", return_value=gh_payload),
+            patch("app.claude_step._fetch_failed_logs") as mock_fetch_logs,
+        ):
+            status, run_id, logs = check_existing_ci("br", "owner/repo")
+
+        assert status == "success"
+        assert run_id == 25970779403
+        assert logs == ""
+        mock_fetch_logs.assert_not_called()

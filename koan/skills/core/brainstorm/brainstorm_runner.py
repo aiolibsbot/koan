@@ -12,6 +12,7 @@ CLI:
         --project-path <path> --topic "Improve caching" --tag prompt-caching
 """
 
+import contextlib
 import hashlib
 import json
 import re
@@ -216,9 +217,10 @@ def _replace_sub_placeholders(created_issues, original_issues, project_path):
     correct original issue body and to build the SUB-N → #number mapping.
     """
     # Build original_pos → real number mapping (preserves original positions)
-    ordinal_to_number = {}
-    for number, _title, _url, original_pos in created_issues:
-        ordinal_to_number[original_pos] = number
+    ordinal_to_number = {
+        original_pos: number
+        for number, _title, _url, original_pos in created_issues
+    }
 
     for number, _title, _url, original_pos in created_issues:
         body = original_issues[original_pos - 1]["body"]
@@ -346,11 +348,11 @@ def _validate_issue_bodies(issues):
         body = issue.get("body", "") or ""
         title = (issue.get("title", "") or "").strip()
         title_preview = title[:40] if title else "?"
-        for header in REQUIRED_ISSUE_SECTIONS:
-            if header not in body:
-                diagnostics.append(
-                    f"Issue {idx} ('{title_preview}'): missing '{header}'"
-                )
+        diagnostics.extend(
+            f"Issue {idx} ('{title_preview}'): missing '{header}'"
+            for header in REQUIRED_ISSUE_SECTIONS
+            if header not in body
+        )
     return diagnostics
 
 
@@ -482,16 +484,14 @@ def _coerce_overall_assessment(value):
 
 def _ensure_label(tag, project_path):
     """Create the GitHub label if it doesn't exist."""
-    try:
+    # Label creation failed — issues will be created without it
+    with contextlib.suppress(RuntimeError, OSError):
         run_gh(
             "label", "create", tag,
             "--description", f"Brainstorm: {tag}",
             "--force",
             cwd=project_path, timeout=15,
         )
-    except (RuntimeError, OSError):
-        # Label creation failed — issues will be created without it
-        pass
 
 
 def _extract_master_title(topic: str) -> str:

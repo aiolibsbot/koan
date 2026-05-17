@@ -12,6 +12,7 @@ import pytest
 from app.claude_step import (
     StepResult,
     _is_ancestor,
+    _prefetch_all_remotes,
     _rebase_onto_target,
     _run_git,
     commit_if_changes,
@@ -142,9 +143,12 @@ class TestRebaseOntoTarget:
     def test_origin_success(self, mock_git):
         result = _rebase_onto_target("main", "/project")
         assert result == "origin"
-        assert mock_git.call_count == 2
         mock_git.assert_any_call(
             ["git", "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"],
+            cwd="/project", timeout=60,
+        )
+        mock_git.assert_any_call(
+            ["git", "fetch", "upstream", "+refs/heads/main:refs/remotes/upstream/main"],
             cwd="/project", timeout=60,
         )
 
@@ -152,9 +156,9 @@ class TestRebaseOntoTarget:
     @patch("app.claude_step._run_git")
     def test_origin_fails_upstream_succeeds(self, mock_git, mock_subprocess):
         def side_effect(cmd, **kwargs):
-            if "origin" in cmd:
-                raise RuntimeError("fetch failed")
-            return MagicMock(returncode=0, stdout="ok")
+            if "rebase" in cmd and any("origin" in a for a in cmd):
+                raise RuntimeError("rebase failed")
+            return ""
 
         mock_git.side_effect = side_effect
         result = _rebase_onto_target("main", "/project")
@@ -170,17 +174,12 @@ class TestRebaseOntoTarget:
     @patch("app.cli_exec.subprocess.run")
     @patch("app.claude_step._run_git")
     def test_rebase_abort_called_on_failure(self, mock_git, mock_subprocess):
-        call_count = 0
-        def selective_fail(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            # Odd calls are fetch (succeed), even calls are rebase (fail)
-            if call_count % 2 == 0:
+        def selective_fail(cmd, **kwargs):
+            if "rebase" in cmd:
                 raise RuntimeError("conflict")
             return ""
         mock_git.side_effect = selective_fail
         _rebase_onto_target("main", "/project")
-        # Should call rebase --abort for each failed remote
         abort_calls = [
             c
             for c in mock_subprocess.call_args_list
@@ -192,11 +191,8 @@ class TestRebaseOntoTarget:
     @patch("app.claude_step._run_git")
     def test_rebase_abort_called_with_timeout(self, mock_git, mock_subprocess):
         """git rebase --abort must have a timeout to prevent hangs in cleanup."""
-        call_count = 0
-        def selective_fail(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            if call_count % 2 == 0:
+        def selective_fail(cmd, **kwargs):
+            if "rebase" in cmd:
                 raise RuntimeError("conflict")
             return ""
         mock_git.side_effect = selective_fail
@@ -214,11 +210,8 @@ class TestRebaseOntoTarget:
     @patch("app.claude_step._run_git")
     def test_timeout_caught_and_logged(self, mock_git, mock_subprocess, capsys):
         """TimeoutExpired should be caught (not just Exception) and logged."""
-        call_count = 0
-        def selective_fail(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            if call_count % 2 == 0:
+        def selective_fail(cmd, **kwargs):
+            if "rebase" in cmd:
                 raise subprocess.TimeoutExpired("git", 60)
             return ""
         mock_git.side_effect = selective_fail
@@ -232,11 +225,8 @@ class TestRebaseOntoTarget:
     @patch("app.claude_step._run_git")
     def test_os_error_caught_and_logged(self, mock_git, mock_subprocess, capsys):
         """OSError (e.g. git not found) should be caught and logged."""
-        call_count = 0
-        def selective_fail(*args, **kwargs):
-            nonlocal call_count
-            call_count += 1
-            if call_count % 2 == 0:
+        def selective_fail(cmd, **kwargs):
+            if "rebase" in cmd:
                 raise OSError("No such file or directory: 'git'")
             return ""
         mock_git.side_effect = selective_fail
@@ -352,80 +342,234 @@ class TestRebaseOntoTargetForkAware:
         assert "--onto" not in rebase_cmd
 
 
+# ---------- _prefetch_all_remotes ----------
+
+
+class TestPrefetchAllRemotes:
+    """Tests for _prefetch_all_remotes — eager base branch sync."""
+
+    @patch("app.claude_step._run_git")
+    def test_fetches_origin_and_upstream(self, mock_git):
+        _prefetch_all_remotes("main", "/project")
+        assert mock_git.call_count == 2
+        mock_git.assert_any_call(
+            ["git", "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main"],
+            cwd="/project", timeout=60,
+        )
+        mock_git.assert_any_call(
+            ["git", "fetch", "upstream", "+refs/heads/main:refs/remotes/upstream/main"],
+            cwd="/project", timeout=60,
+        )
+
+    @patch("app.claude_step._run_git")
+    def test_includes_head_remote(self, mock_git):
+        _prefetch_all_remotes("main", "/project", head_remote="myfork")
+        fetched = [c[0][0][2] for c in mock_git.call_args_list]
+        assert "myfork" in fetched
+        assert "origin" in fetched
+        assert "upstream" in fetched
+
+    @patch("app.claude_step._run_git")
+    def test_preferred_remote_first(self, mock_git):
+        _prefetch_all_remotes("main", "/project", preferred_remote="upstream")
+        first_call_remote = mock_git.call_args_list[0][0][0][2]
+        assert first_call_remote == "upstream"
+
+    @patch("app.claude_step._run_git")
+    def test_no_duplicate_when_head_in_ordered(self, mock_git):
+        _prefetch_all_remotes("main", "/project", head_remote="origin")
+        assert mock_git.call_count == 2
+
+    @patch("app.claude_step._run_git")
+    def test_failure_is_nonfatal(self, mock_git, capsys):
+        mock_git.side_effect = RuntimeError("network down")
+        _prefetch_all_remotes("main", "/project")
+        captured = capsys.readouterr()
+        assert "Pre-fetch" in captured.err
+        assert "non-fatal" in captured.err
+
+    @patch("app.claude_step._run_git")
+    def test_timeout_is_nonfatal(self, mock_git, capsys):
+        mock_git.side_effect = subprocess.TimeoutExpired("git", 60)
+        _prefetch_all_remotes("main", "/project")
+        captured = capsys.readouterr()
+        assert "Pre-fetch" in captured.err
+
+
+
 # ---------- run_claude ----------
 
 
-class TestRunClaude:
-    """Tests for run_claude — CLI invocation wrapper."""
+class _FakeStream:
+    """Iterable + closable stand-in for ``proc.stdout`` / ``proc.stderr``.
 
-    @patch("app.cli_exec.subprocess.run")
-    def test_success(self, mock_run):
-        mock_run.return_value = MagicMock(
-            returncode=0, stdout="  done  \n", stderr=""
-        )
+    Tests need a file-like object that supports both ``for line in stream``
+    iteration and ``stream.close()`` — a bare ``iter([])`` does not.
+    """
+
+    def __init__(self, lines=None, read_text=""):
+        self._lines = list(lines or [])
+        self._read_text = read_text
+
+    def __iter__(self):
+        return iter(self._lines)
+
+    def read(self):
+        return self._read_text
+
+    def close(self):
+        return None
+
+
+def _fake_proc(stdout_lines, stderr_text="", returncode=0, pid=99999):
+    """Build a fake Popen object for streaming tests.
+
+    ``stdout_lines`` is a list of full lines (each entry should already
+    contain a trailing newline if needed). ``proc.stdout`` becomes an
+    iterable so the streaming loop in ``run_claude`` can consume it.
+    """
+    proc = MagicMock()
+    proc.stdout = _FakeStream(lines=stdout_lines)
+    proc.stderr = _FakeStream(read_text=stderr_text)
+    proc.returncode = returncode
+    proc.pid = pid
+    proc.wait.return_value = returncode
+    return proc
+
+
+class TestRunClaude:
+    """Tests for run_claude — streams stdout, captures full output."""
+
+    @patch("app.claude_step.popen_cli")
+    def test_success(self, mock_popen):
+        proc = _fake_proc(["  done  \n"], stderr_text="", returncode=0)
+        mock_popen.return_value = (proc, lambda: None)
         result = run_claude(["claude", "-p", "test"], "/project")
         assert result["success"] is True
         assert result["output"] == "done"
         assert result["error"] == ""
 
-    @patch("app.cli_exec.subprocess.run")
-    def test_failure_with_stderr(self, mock_run):
-        mock_run.return_value = MagicMock(
-            returncode=1, stdout="partial", stderr="something broke"
+    @patch("app.claude_step.popen_cli")
+    def test_failure_with_stderr(self, mock_popen):
+        proc = _fake_proc(
+            ["partial\n"], stderr_text="something broke", returncode=1,
         )
+        mock_popen.return_value = (proc, lambda: None)
         result = run_claude(["claude", "-p", "test"], "/project")
         assert result["success"] is False
         assert "Exit code 1" in result["error"]
         assert "something broke" in result["error"]
 
-    @patch("app.cli_exec.subprocess.run")
-    def test_failure_no_stderr(self, mock_run):
-        mock_run.return_value = MagicMock(
-            returncode=1, stdout="", stderr=""
-        )
+    @patch("app.claude_step.popen_cli")
+    def test_failure_no_stderr(self, mock_popen):
+        proc = _fake_proc([], stderr_text="", returncode=1)
+        mock_popen.return_value = (proc, lambda: None)
         result = run_claude(["claude", "-p", "test"], "/project")
         assert result["success"] is False
         assert "no stderr" in result["error"]
 
-    @patch("app.cli_exec.subprocess.run")
-    def test_failure_no_stderr_includes_stdout(self, mock_run):
+    @patch("app.claude_step.popen_cli")
+    def test_failure_no_stderr_includes_stdout(self, mock_popen):
         """When stderr is empty but stdout has content, error includes stdout."""
-        mock_run.return_value = MagicMock(
+        proc = _fake_proc(
+            ["Error: context window exceeded\n"],
+            stderr_text="",
             returncode=1,
-            stdout="Error: context window exceeded",
-            stderr="",
         )
+        mock_popen.return_value = (proc, lambda: None)
         result = run_claude(["claude", "-p", "test"], "/project")
         assert result["success"] is False
         assert "no stderr" in result["error"]
         assert "stdout:" in result["error"]
         assert "context window exceeded" in result["error"]
 
-    @patch("app.cli_exec.subprocess.run")
-    def test_timeout(self, mock_run):
-        mock_run.side_effect = subprocess.TimeoutExpired(cmd="claude", timeout=600)
-        result = run_claude(["claude", "-p", "test"], "/project")
+    @patch("app.claude_step.popen_cli")
+    def test_timeout_kills_process_group(self, mock_popen):
+        """When the watchdog fires, run_claude returns a Timeout error.
+
+        Simulates a hanging child by blocking stdout iteration until the
+        watchdog thread invokes the kill callback. The kill is monkey-
+        patched to set the unblock event, mirroring what os.killpg would
+        do in production (cause the child to exit and stdout to EOF).
+        """
+        import os
+        import threading
+
+        killed = threading.Event()
+
+        class _BlockingStream:
+            def __iter__(self):
+                killed.wait(timeout=10)
+                return iter([])
+
+            def read(self):
+                return ""
+
+            def close(self):
+                return None
+
+        proc = MagicMock()
+        proc.stdout = _BlockingStream()
+        proc.stderr = _FakeStream(read_text="")
+        proc.returncode = -9
+        proc.pid = 12345
+        proc.wait.return_value = -9
+        mock_popen.return_value = (proc, lambda: None)
+
+        # Use a tiny timeout so the watchdog fires within the test.
+        with patch("os.killpg", side_effect=lambda *a, **kw: killed.set()):
+            with patch.object(os, "getpgid", return_value=12345):
+                result = run_claude(
+                    ["claude", "-p", "test"], "/project", timeout=1,
+                )
+
         assert result["success"] is False
         assert "Timeout" in result["error"]
-        assert "600" in result["error"]
+        assert "1" in result["error"]
 
-    @patch("app.cli_exec.subprocess.run")
-    def test_custom_timeout(self, mock_run):
-        mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
-        run_claude(["claude", "-p", "test"], "/project", timeout=120)
-        call_kwargs = mock_run.call_args[1]
-        assert call_kwargs["timeout"] == 120
-        assert call_kwargs["cwd"] == "/project"
-
-    @patch("app.cli_exec.subprocess.run")
-    def test_long_stderr_truncated(self, mock_run):
-        long_err = "E" * 1000
-        mock_run.return_value = MagicMock(
-            returncode=1, stdout="", stderr=long_err
+    @patch("app.claude_step.popen_cli")
+    def test_streams_stdout_lines(self, mock_popen, capsys):
+        """Each Claude stdout line must be forwarded to parent stdout
+        so the run.py liveness watchdog resets on every line."""
+        proc = _fake_proc(
+            ["thinking...\n", "calling tool\n", "done\n"],
+            stderr_text="",
+            returncode=0,
         )
+        mock_popen.return_value = (proc, lambda: None)
+        run_claude(["claude", "-p", "test"], "/project")
+        captured = capsys.readouterr()
+        assert "thinking..." in captured.out
+        assert "calling tool" in captured.out
+        assert "done" in captured.out
+
+    @patch("app.claude_step.popen_cli")
+    def test_uses_new_session_for_process_group_kill(self, mock_popen):
+        """popen must request a new POSIX session so the whole process
+        group can be killed on timeout — preventing grandchildren from
+        holding the stdout pipe open and hanging the drain."""
+        proc = _fake_proc(["ok\n"], returncode=0)
+        mock_popen.return_value = (proc, lambda: None)
+        run_claude(["claude", "-p", "test"], "/project")
+        call_kwargs = mock_popen.call_args.kwargs
+        assert call_kwargs.get("start_new_session") is True
+
+    @patch("app.claude_step.popen_cli")
+    def test_long_stderr_truncated(self, mock_popen):
+        long_err = "E" * 1000
+        proc = _fake_proc([], stderr_text=long_err, returncode=1)
+        mock_popen.return_value = (proc, lambda: None)
         result = run_claude(["claude", "-p", "test"], "/project")
         # Should only keep last 500 chars of stderr
         assert len(result["error"]) < 600
+
+    @patch("app.claude_step.popen_cli")
+    def test_cleanup_called_on_success(self, mock_popen):
+        proc = _fake_proc(["ok\n"], returncode=0)
+        cleanup = MagicMock()
+        mock_popen.return_value = (proc, cleanup)
+        run_claude(["claude", "-p", "test"], "/project")
+        cleanup.assert_called_once()
 
 
 # ---------- commit_if_changes ----------

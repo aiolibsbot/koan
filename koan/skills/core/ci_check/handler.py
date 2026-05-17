@@ -59,6 +59,11 @@ def handle(ctx):
             f"this instance. I only run CI checks on my own pull requests."
         )
 
-    _gh_helpers.queue_github_mission(ctx, "ci_check", pr_url, project_name)
+    duplicate = _gh_helpers.queue_github_mission_once(
+        ctx, "ci_check", pr_url, project_name,
+        type_label="PR", number=pr_number, owner=owner, repo=repo,
+    )
+    if duplicate:
+        return duplicate
 
     return f"\U0001f527 CI check queued for {_gh_helpers.format_success_message('PR', pr_number, owner, repo)}"

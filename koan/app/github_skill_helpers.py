@@ -90,7 +90,7 @@ def resolve_project_for_repo(repo: str, owner: Optional[str] = None) -> Tuple[Op
 def queue_github_mission(
     ctx, command: str, url: str, project_name: str,
     context: Optional[str] = None, *, urgent: bool = False,
-) -> None:
+) -> bool:
     """Queue a GitHub-related mission with consistent formatting.
 
     Args:
@@ -100,6 +100,9 @@ def queue_github_mission(
         project_name: Project name for tagging
         context: Optional additional context to append
         urgent: If True, insert at the top of the queue (--now flag)
+
+    Returns:
+        True if the mission was queued, False if it was a duplicate.
     """
     from app.utils import insert_pending_mission
 
@@ -109,7 +112,29 @@ def queue_github_mission(
 
     mission_entry = f"- [project:{project_name}] {mission_text}"
     missions_path = ctx.instance_dir / "missions.md"
-    insert_pending_mission(missions_path, mission_entry, urgent=urgent)
+    return insert_pending_mission(missions_path, mission_entry, urgent=urgent)
+
+
+def queue_github_mission_once(
+    ctx, command: str, url: str, project_name: str,
+    context: Optional[str] = None, *, urgent: bool = False,
+    type_label: str = "PR", number: int = 0,
+    owner: str = "", repo: str = "",
+) -> Optional[str]:
+    """Queue a GitHub mission, returning a duplicate warning if skipped.
+
+    Combines queue_github_mission + standard duplicate message into one call.
+
+    Returns:
+        A ⚠️ duplicate warning string if skipped, None if successfully queued.
+    """
+    inserted = queue_github_mission(ctx, command, url, project_name, context, urgent=urgent)
+    if not inserted:
+        return (
+            f"\u26a0\ufe0f Duplicate ignored — /{command} already queued or running "
+            f"for {type_label} #{number} ({owner}/{repo})."
+        )
+    return None
 
 
 def format_project_not_found_error(repo: str, owner: Optional[str] = None) -> str:
@@ -158,7 +183,7 @@ def _find_repo_name_matches(repo: str) -> list:
         config = load_projects_config(str(KOAN_ROOT))
         if not config:
             return matches
-        for _name, project in config.get("projects", {}).items():
+        for project in config.get("projects", {}).values():
             if not isinstance(project, dict):
                 continue
             gh_url = project.get("github_url", "")
@@ -251,8 +276,13 @@ def handle_github_skill(
     if not project_path:
         return format_project_not_found_error(repo, owner=owner)
 
-    # Queue mission
-    queue_github_mission(ctx, command, url, project_name, context, urgent=urgent)
+    # Queue mission (with duplicate detection)
+    duplicate = queue_github_mission_once(
+        ctx, command, url, project_name, context, urgent=urgent,
+        type_label=type_label, number=number, owner=owner, repo=repo,
+    )
+    if duplicate:
+        return duplicate
 
     # Return success message
     priority = " (priority)" if urgent else ""

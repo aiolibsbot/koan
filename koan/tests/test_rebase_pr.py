@@ -354,8 +354,8 @@ class TestRebaseOntoTarget:
     def test_falls_back_to_upstream(self):
         def mock_run(cmd, **kwargs):
             result = MagicMock(returncode=0, stdout="", stderr="")
-            if "origin" in cmd and "fetch" in cmd:
-                raise RuntimeError("fetch failed")
+            if "rebase" in cmd and any("origin" in a for a in cmd) and "--abort" not in cmd:
+                raise RuntimeError("rebase failed")
             return result
 
         with patch("app.claude_step.subprocess.run", side_effect=mock_run):
@@ -648,6 +648,29 @@ class TestFetchPrContext:
         assert context["diff"] == ""
         assert context["review_comments"] == ""
         assert context["has_pending_reviews"] is False
+        # mergeable defaults to UNKNOWN when not provided
+        assert context["mergeable"] == "UNKNOWN"
+
+    @patch("app.github.subprocess.run")
+    def test_extracts_mergeable_status(self, mock_run):
+        """fetch_pr_context surfaces the PR mergeable field for downstream consumers."""
+        mock_run.side_effect = [
+            MagicMock(returncode=0, stdout=json.dumps({
+                "title": "Fix",
+                "headRefName": "br",
+                "baseRefName": "main",
+                "state": "OPEN",
+                "author": {"login": "dev"},
+                "mergeable": "CONFLICTING",
+            })),
+            MagicMock(returncode=0, stdout="0"),
+            MagicMock(returncode=0, stdout="+diff"),
+            MagicMock(returncode=0, stdout=""),
+            MagicMock(returncode=0, stdout=""),
+            MagicMock(returncode=0, stdout=""),
+        ]
+        context = fetch_pr_context("o", "r", "1")
+        assert context["mergeable"] == "CONFLICTING"
 
     @patch("app.github.subprocess.run")
     def test_handles_invalid_json(self, mock_run):

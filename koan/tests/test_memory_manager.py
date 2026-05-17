@@ -1,8 +1,10 @@
 """Tests for memory_manager.py — scoped summary, compaction, learnings dedup, journal archival."""
 
-import pytest
+import contextlib
 from datetime import date, timedelta
 from unittest.mock import patch
+
+import pytest
 
 from app.memory_manager import (
     MemoryManager,
@@ -799,6 +801,31 @@ class TestCompactLearnings:
         stats = compact_learnings(str(tmp_path), "koan", max_lines=100)
         assert stats["skipped"] is True
 
+    def test_no_subprocess_when_below_threshold(self, tmp_path):
+        """_get_file_tree (git subprocess) must not run when below threshold."""
+        self._write_learnings(tmp_path, "koan", "# Learnings\n\n- fact 1\n- fact 2\n")
+        with patch("app.memory_manager.MemoryManager._get_file_tree") as mock_tree:
+            stats = compact_learnings(str(tmp_path), "koan", max_lines=100)
+        assert stats["skipped"] is True
+        mock_tree.assert_not_called()
+
+    def test_no_subprocess_when_hash_unchanged(self, tmp_path):
+        """_get_file_tree must not run on a repeat call with unchanged content."""
+        lines = ["# Learnings", ""]
+        for i in range(150):
+            lines.append(f"- fact {i}")
+        self._write_learnings(tmp_path, "koan", "\n".join(lines))
+
+        compacted_output = "- merged fact A\n- merged fact B\n"
+        with patch("app.memory_manager.MemoryManager._run_compaction_cli", return_value=compacted_output):
+            compact_learnings(str(tmp_path), "koan", max_lines=100)
+
+        # Second call: content now below threshold — subprocess must not run
+        with patch("app.memory_manager.MemoryManager._get_file_tree") as mock_tree:
+            stats2 = compact_learnings(str(tmp_path), "koan", max_lines=100)
+        assert stats2["skipped"] is True
+        mock_tree.assert_not_called()
+
     def test_skips_when_hash_unchanged(self, tmp_path):
         """Second call with same content is skipped via hash check."""
         lines = ["# Learnings", ""]
@@ -1263,10 +1290,8 @@ class TestCLIMainBlock:
         out = StringIO()
         with patch.object(sys, "argv", ["memory_manager", str(tmp_path), "scoped-summary", "koan"]):
             with patch("sys.stdout", out):
-                try:
+                with contextlib.suppress(SystemExit):
                     run_module("app.memory_manager", run_name="__main__")
-                except SystemExit:
-                    pass
         assert "koan work" in out.getvalue()
         assert "other work" not in out.getvalue()
 
@@ -1298,10 +1323,8 @@ class TestCLIMainBlock:
         out = StringIO()
         with patch.object(sys, "argv", ["memory_manager", str(tmp_path), "compact", "5"]):
             with patch("sys.stdout", out):
-                try:
+                with contextlib.suppress(SystemExit):
                     run_module("app.memory_manager", run_name="__main__")
-                except SystemExit:
-                    pass
         assert "Compacted: 6 sessions removed" in out.getvalue()
 
     def test_compact_default_max(self, tmp_path):
@@ -1318,10 +1341,8 @@ class TestCLIMainBlock:
         out = StringIO()
         with patch.object(sys, "argv", ["memory_manager", str(tmp_path), "compact"]):
             with patch("sys.stdout", out):
-                try:
+                with contextlib.suppress(SystemExit):
                     run_module("app.memory_manager", run_name="__main__")
-                except SystemExit:
-                    pass
         assert "Compacted: 0 sessions removed" in out.getvalue()
 
     def test_cleanup_learnings_command(self, tmp_path):
@@ -1338,10 +1359,8 @@ class TestCLIMainBlock:
         out = StringIO()
         with patch.object(sys, "argv", ["memory_manager", str(tmp_path), "cleanup-learnings", "koan"]):
             with patch("sys.stdout", out):
-                try:
+                with contextlib.suppress(SystemExit):
                     run_module("app.memory_manager", run_name="__main__")
-                except SystemExit:
-                    pass
         assert "Deduped: 1 lines removed" in out.getvalue()
 
     def test_cleanup_learnings_no_project_exits_1(self, tmp_path):
@@ -1371,10 +1390,8 @@ class TestCLIMainBlock:
         out = StringIO()
         with patch.object(sys, "argv", ["memory_manager", str(tmp_path), "archive-journals"]):
             with patch("sys.stdout", out):
-                try:
+                with contextlib.suppress(SystemExit):
                     run_module("app.memory_manager", run_name="__main__")
-                except SystemExit:
-                    pass
         output = out.getvalue()
         assert "archived_days" in output
 
@@ -1390,10 +1407,8 @@ class TestCLIMainBlock:
         out = StringIO()
         with patch.object(sys, "argv", ["memory_manager", str(tmp_path), "archive-journals", "7"]):
             with patch("sys.stdout", out):
-                try:
+                with contextlib.suppress(SystemExit):
                     run_module("app.memory_manager", run_name="__main__")
-                except SystemExit:
-                    pass
         output = out.getvalue()
         assert "archived_days" in output
 
@@ -1411,10 +1426,8 @@ class TestCLIMainBlock:
         out = StringIO()
         with patch.object(sys, "argv", ["memory_manager", str(tmp_path), "cleanup"]):
             with patch("sys.stdout", out):
-                try:
+                with contextlib.suppress(SystemExit):
                     run_module("app.memory_manager", run_name="__main__")
-                except SystemExit:
-                    pass
         output = out.getvalue()
         assert "summary_compacted" in output
 
@@ -1435,9 +1448,7 @@ class TestCLIMainBlock:
         out = StringIO()
         with patch.object(sys, "argv", ["memory_manager", str(tmp_path), "cleanup", "5"]):
             with patch("sys.stdout", out):
-                try:
+                with contextlib.suppress(SystemExit):
                     run_module("app.memory_manager", run_name="__main__")
-                except SystemExit:
-                    pass
         output = out.getvalue()
         assert "summary_compacted" in output
