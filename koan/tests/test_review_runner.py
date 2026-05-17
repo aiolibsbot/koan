@@ -731,6 +731,66 @@ class TestRunReview:
         assert success is False
         assert "failed to post" in summary.lower()
 
+    @patch("app.review_runner._fetch_pr_commit_shas", return_value=[])
+    @patch("app.review_runner.fetch_repliable_comments", return_value=[])
+    @patch("app.review_runner.run_gh")
+    @patch("app.review_runner._run_claude_review")
+    @patch("app.review_runner.fetch_pr_context")
+    def test_conflict_notice_prepended_for_conflicting_pr(
+        self, mock_fetch, mock_claude, mock_gh, mock_repliable, _mock_shas,
+        pr_context, review_skill_dir,
+    ):
+        """When mergeable=CONFLICTING, posted comment leads with a conflict warning."""
+        pr_context["mergeable"] = "CONFLICTING"
+        pr_context["base"] = "develop"
+        mock_fetch.return_value = pr_context
+        mock_claude.return_value = (json.dumps(LGTM_REVIEW_JSON), "")
+        mock_notify = MagicMock()
+
+        success, _summary, _rd = run_review(
+            "owner", "repo", "42", "/tmp/project",
+            notify_fn=mock_notify,
+            skill_dir=review_skill_dir,
+        )
+
+        assert success is True
+        # Find the --body argument passed to gh
+        call = mock_gh.call_args
+        body = call.kwargs.get("body") or next(
+            (a for a in call.args if "Merge conflicts" in str(a)), ""
+        )
+        assert "Merge conflicts detected" in body
+        assert "develop" in body
+        # Warning appears BEFORE the review body
+        assert body.index("Merge conflicts detected") < body.index("## PR Review")
+
+    @patch("app.review_runner._fetch_pr_commit_shas", return_value=[])
+    @patch("app.review_runner.fetch_repliable_comments", return_value=[])
+    @patch("app.review_runner.run_gh")
+    @patch("app.review_runner._run_claude_review")
+    @patch("app.review_runner.fetch_pr_context")
+    def test_no_conflict_notice_for_mergeable_pr(
+        self, mock_fetch, mock_claude, mock_gh, mock_repliable, _mock_shas,
+        pr_context, review_skill_dir,
+    ):
+        """When mergeable=MERGEABLE, no conflict warning is added."""
+        pr_context["mergeable"] = "MERGEABLE"
+        mock_fetch.return_value = pr_context
+        mock_claude.return_value = (json.dumps(LGTM_REVIEW_JSON), "")
+        mock_notify = MagicMock()
+
+        success, _summary, _rd = run_review(
+            "owner", "repo", "42", "/tmp/project",
+            notify_fn=mock_notify,
+            skill_dir=review_skill_dir,
+        )
+
+        assert success is True
+        call = mock_gh.call_args
+        body_args = [str(a) for a in call.args] + [str(v) for v in call.kwargs.values()]
+        joined = "\n".join(body_args)
+        assert "Merge conflicts detected" not in joined
+
 
 # ---------------------------------------------------------------------------
 # _run_claude_review

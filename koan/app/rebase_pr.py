@@ -56,7 +56,7 @@ def fetch_pr_context(owner: str, repo: str, pr_number: str) -> dict:
     # Fetch PR metadata
     pr_json = run_gh(
         "pr", "view", pr_number, "--repo", full_repo, "--json",
-        "title,body,headRefName,baseRefName,state,author,url,headRepositoryOwner",
+        "title,body,headRefName,baseRefName,state,author,url,headRepositoryOwner,mergeable",
     )
 
     # Fetch review comment count from REST API for pending review detection.
@@ -138,6 +138,7 @@ def fetch_pr_context(owner: str, repo: str, pr_number: str) -> dict:
         "author": metadata.get("author", {}).get("login", ""),
         "head_owner": metadata.get("headRepositoryOwner", {}).get("login", ""),
         "url": metadata.get("url", ""),
+        "mergeable": metadata.get("mergeable", "UNKNOWN"),
         "diff": truncate_diff(diff, 32000),
         "review_comments": truncate_text(comments_json, 4000),
         "reviews": truncate_text(reviews_json, 3000),

@@ -632,6 +632,15 @@ def _format_review_as_markdown(review_data: dict, title: str = "") -> str:
     return "\n".join(lines)
 
 
+def _conflict_notice(base: str) -> str:
+    """Build a prominent warning block when a PR has unresolved merge conflicts."""
+    return (
+        f"> ⚠️ **Merge conflicts detected** — this PR conflicts with `{base}` "
+        f"and cannot be merged until the author rebases (or merges in `{base}`) "
+        f"and resolves the conflicted files."
+    )
+
+
 def _post_review_comment(
     owner: str, repo: str, pr_number: str, review_text: str,
     existing_comment: Optional[dict] = None,
@@ -1009,6 +1018,12 @@ def run_review(
             file=sys.stderr,
         )
         review_body = _extract_review_body(raw_output)
+
+    # Prepend merge-conflict notice when the PR is in CONFLICTING state.
+    # The code review alone never surfaces this — the human needs an explicit
+    # call to resolve conflicts before merge is possible.
+    if context.get("mergeable") == "CONFLICTING":
+        review_body = _conflict_notice(context.get("base", "main")) + "\n\n" + review_body
 
     # Step 6: Post (or update) review comment (Phase 3 — idempotent upsert)
     # Commit SHAs are embedded in the body upfront to avoid extra API calls.
